@@ -235,7 +235,12 @@ module.exports = NodeHelper.create({
       .then((response) => {
         response.text().then((body) => {
           self.processResponse(response, body, config);
+        }).catch((err) => {
+          console.error("MMM-Wallpaper: Failed to read response body:", err);
         });
+      })
+      .catch((err) => {
+        console.error("MMM-Wallpaper: Fetch error:", err);
       });
   },
 
@@ -264,28 +269,37 @@ module.exports = NodeHelper.create({
     var self = this;
     var images;
 
-    var source = config.source.toLowerCase();
-    if (source.startsWith("/r/") || source.startsWith("/user/")) {
-      images = self.processRedditData(config, JSON.parse(body));
-    } else if (source.startsWith("icloud:")) {
-      images = self.processiCloudData(response, JSON.parse(body), config);
-    } else if (source === "pexels") {
-      images = self.processPexelsData(config, JSON.parse(body));
-    } else if (source.startsWith("lightroom:")) {
-      images = self.processLightroomData(config, body);
-    } else if (source.startsWith("synology-moments:")) {
-      images = self.processSynologyMomentsData(response, body, config);
-    } else if (source.startsWith("metmuseum:")) {
-      images = self.processMetMuseumData(config, JSON.parse(body));
-    } else if (source.startsWith("nasa:")) {
-      images = self.processNasaData(config, JSON.parse(body));
-    } else if ((source === "apod") || (source === "apodhd")) {
-      images = self.processApodData(config, JSON.parse(body));
-    } else {
-      images = self.processBingData(config, JSON.parse(body));
+    try {
+      var source = config.source.toLowerCase();
+      if (source.startsWith("/r/") || source.startsWith("/user/")) {
+        images = self.processRedditData(config, JSON.parse(body));
+      } else if (source.startsWith("icloud:")) {
+        if (response.status !== 200 && response.status !== 330) {
+          console.error(`MMM-Wallpaper: iCloud request failed with HTTP ${response.status}`);
+          return;
+        }
+        images = self.processiCloudData(response, JSON.parse(body), config);
+      } else if (source === "pexels") {
+        images = self.processPexelsData(config, JSON.parse(body));
+      } else if (source.startsWith("lightroom:")) {
+        images = self.processLightroomData(config, body);
+      } else if (source.startsWith("synology-moments:")) {
+        images = self.processSynologyMomentsData(response, body, config);
+      } else if (source.startsWith("metmuseum:")) {
+        images = self.processMetMuseumData(config, JSON.parse(body));
+      } else if (source.startsWith("nasa:")) {
+        images = self.processNasaData(config, JSON.parse(body));
+      } else if ((source === "apod") || (source === "apodhd")) {
+        images = self.processApodData(config, JSON.parse(body));
+      } else {
+        images = self.processBingData(config, JSON.parse(body));
+      }
+    } catch (err) {
+      console.error("MMM-Wallpaper: Failed to parse or process response:", err);
+      return;
     }
 
-    if (images.length === 0) {
+    if (!images || images.length === 0) {
       return;
     }
 
@@ -366,6 +380,10 @@ module.exports = NodeHelper.create({
         self.request(config, {
           method: "POST",
           url: `https://${self.iCloudHost}/${album}/sharedstreams/webstream`,
+          headers: {
+            "Content-Type": "text/plain",
+            "User-Agent": "MagicMirror:MMM-Wallpaper:v1.0 (by /u/kolbyhack)",
+          },
           body: '{"streamCtag":null}'
         });
       } else if (response.status === 200) {
