@@ -76,7 +76,7 @@ module.exports = NodeHelper.create({
 
     config.source = pick(config.source);
     const cacheEntry = self.getCacheEntry(config);
-    if (config.maximumEntries <= cacheEntry.images.length && Date.now() < cacheEntry.expires) {
+    if (cacheEntry.images.length > 0 && Date.now() < cacheEntry.expires) {
       self.sendResult(config);
       return;
     }
@@ -94,6 +94,8 @@ module.exports = NodeHelper.create({
       self.cacheResult(config, shuffle(self.chromecast));
     } else if (source.startsWith("local:")) {
       self.readdir(config);
+    } else if (source.startsWith("icloud:") || source.includes("photos.icloud.com")) {
+      self.fetchICloud(config);
     } else if (source.startsWith("http://") || source.startsWith("https://")) {
       let url = config.source;
       if (config.addCacheBuster) {
@@ -123,20 +125,6 @@ module.exports = NodeHelper.create({
         headers: {
           Authorization: config.pexels_key
         },
-      });
-    } else if (source.startsWith("icloud:")) {
-      const album = config.source.substring(7).trim();
-      const partition = b62decode((album[0] === "A") ? album[1] : album.substring(1, 3));
-      self.iCloudHost = `p${partition}-sharedstreams.icloud.com`;
-      self.iCloudState = "webstream";
-      self.request(config, {
-        method: "POST",
-        url: `https://${self.iCloudHost}/${album}/sharedstreams/webstream`,
-        headers: {
-          "Content-Type": "text/plain",
-          "User-Agent": "MagicMirror:MMM-Wallpaper:v1.0 (by /u/kolbyhack)",
-        },
-        body: '{"streamCtag":null}',
       });
     } else if (source.startsWith("flickr-api:")) {
       self.fetchFlickrApi(config);
@@ -174,6 +162,152 @@ module.exports = NodeHelper.create({
       self.request(config, {
         url: `https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=${config.maximumEntries}`,
       });
+    }
+  },
+
+  fetchICloud: function(config) {
+    var self = this;
+    let token = config.source.trim();
+    if (token.toLowerCase().startsWith("icloud:")) {
+      token = token.substring(7).trim();
+    }
+    const urlMatch = token.match(/photos\.icloud\.com\/shared\/album\/([a-zA-Z0-9_-]+)/i);
+    if (urlMatch) {
+      token = urlMatch[1];
+    }
+
+    const isCloudKit = config.source.includes("photos.icloud.com") ||
+                       token.includes("_") ||
+                       token.includes("-") ||
+                       /^[0-9]/.test(token) ||
+                       token.length >= 20;
+
+    if (isCloudKit) {
+      self.fetchCloudKitICloud(config, token);
+    } else {
+      self.fetchLegacyICloud(config, token);
+    }
+  },
+
+  fetchLegacyICloud: function(config, album) {
+    var self = this;
+    const partition = b62decode((album[0] === "A") ? album[1] : album.substring(1, 3));
+    self.iCloudHost = `p${partition}-sharedstreams.icloud.com`;
+    self.iCloudState = "webstream";
+    self.request(config, {
+      method: "POST",
+      url: `https://${self.iCloudHost}/${album}/sharedstreams/webstream`,
+      headers: {
+        "Content-Type": "text/plain",
+        "User-Agent": "MagicMirror:MMM-Wallpaper:v1.0 (by /u/kolbyhack)",
+      },
+      body: '{"streamCtag":null}',
+    });
+  },
+
+  fetchCloudKitICloud: async function(config, token) {
+    var self = this;
+    try {
+      const resolveUrl = `https://ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/public/records/resolve?remapEnums=true&getCurrentSyncToken=true&sharing_url_key=${token}`;
+      const resolveRes = await fetch(resolveUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ shortGUIDs: [{ value: token }] })
+      });
+      if (!resolveRes.ok) {
+        console.error(`MMM-Wallpaper: CloudKit resolve failed with HTTP ${resolveRes.status}`);
+        return;
+      }
+      const resolveData = await resolveRes.json();
+      const result = resolveData.results && resolveData.results[0];
+      if (!result || !result.anonymousPublicAccess || !result.zoneID) {
+        if (!config.source.includes("photos.icloud.com")) {
+          console.warn("MMM-Wallpaper: CloudKit resolve failed, falling back to legacy sharedstreams for:", token);
+          self.fetchLegacyICloud(config, token);
+          return;
+        }
+        console.error("MMM-Wallpaper: CloudKit resolve failed:", result ? (result.reason || result.serverErrorCode) : "Empty result");
+        return;
+      }
+      const auth = result.anonymousPublicAccess;
+      const zoneID = result.zoneID;
+
+      const queryUrl = `${auth.databasePartition}/database/1/com.apple.photos.cloud/production/shared/records/query?remapEnums=true&getCurrentSyncToken=true&sharing_url_key=${token}&publicAccessAuthToken=${encodeURIComponent(auth.token)}`;
+
+      let images = [];
+      let continuationMarker = null;
+      let startRank = 0;
+      const maxToFetch = Math.max(config.maximumEntries || 100, 200);
+
+      do {
+        const queryBody = {
+          query: {
+            recordType: "CPLAssetAndMasterByAddedDate"
+          },
+          zoneID: zoneID,
+          resultsLimit: 200
+        };
+
+        if (continuationMarker) {
+          queryBody.continuationMarker = continuationMarker;
+        } else {
+          queryBody.query.filterBy = [
+            { fieldName: "direction", comparator: "EQUALS", fieldValue: { value: "ASCENDING", type: "STRING" } },
+            { fieldName: "startRank", comparator: "EQUALS", fieldValue: { value: startRank, type: "INT64" } }
+          ];
+        }
+
+        const queryRes = await fetch(queryUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(queryBody)
+        });
+
+        if (!queryRes.ok) {
+          console.error(`MMM-Wallpaper: CloudKit query failed with HTTP ${queryRes.status}`);
+          break;
+        }
+
+        const queryData = await queryRes.json();
+        if (!queryData.records || !Array.isArray(queryData.records) || queryData.records.length === 0) {
+          break;
+        }
+
+        for (const rec of queryData.records) {
+          if (rec.recordType === "CPLMaster" && rec.fields) {
+            const f = rec.fields;
+            const resObj = f.resOriginalRes || f.resJPEGFullRes || f.resJPEGMedRes;
+            if (resObj && resObj.value && resObj.value.downloadURL) {
+              // Always transcode to public.jpeg for web display compatibility
+              const url = resObj.value.downloadURL.replace("${f}", "public.jpeg");
+              const width = (f.resOriginalWidth && f.resOriginalWidth.value) || 0;
+              const height = (f.resOriginalHeight && f.resOriginalHeight.value) || 0;
+
+              images.push({
+                url: url,
+                caption: (f.caption && f.caption.value) || "",
+                variants: width > 0 ? [{ url: url, width: width, height: height }] : []
+              });
+            }
+          }
+        }
+
+        continuationMarker = queryData.continuationMarker || null;
+      } while (continuationMarker && images.length < maxToFetch);
+
+      if (config.shuffle) {
+        images = shuffle(images);
+      }
+
+      if (images.length === 0) {
+        console.warn("MMM-Wallpaper: CloudKit query found 0 image records");
+        return;
+      }
+
+      console.log(`MMM-Wallpaper: Loaded ${images.length} images from iCloud album`);
+      self.cacheResult(config, images);
+    } catch (err) {
+      console.error("MMM-Wallpaper: Error fetching CloudKit iCloud photos:", err);
     }
   },
 
